@@ -1,0 +1,40 @@
+Arhitectură Generală
+
+server.cpp pornește prin a crea/deschide două FIFO-uri (FIFO_INTRARE, FIFO_IESIRE) și intră într-o buclă care citește linii din client_to_server.fifo (server.cpp:18-207).
+Comenzile sunt parcurse de funcția lambda proceseaza_comanda, care verifică autentificarea, declanșează procese copil și trimite răspunsuri prefixate cu lungime către client (server.cpp:213-447).
+Utilizatorul curent și starea de autentificare sunt păstrate în variabilele parentului (este_logat, utilizator_curent) astfel încât fiecare sesiune să fie controlată central (server.cpp:226-233).
+Clientul (client.cpp:3-79) deschide aceleași FIFO-uri, citește comenzi din stdin, le scrie cu newline către server și apoi citește răspunsul prin protocolul lungime+payload.
+Funcțiile de utilitate din server.cpp (scrie_tot, citeste_tot, trimite_raspuns, executa_in_copil) gestionează robust comunicarea și resursele (retry pe EINTR, waitpid, conversie endianness).
+IPC Utilizat
+
+FIFO-uri numite oferă canalul persistent client↔server: client_to_server.fifo pentru comenzi (client → server) și server_to_client.fifo pentru răspunsuri prefixate (server → client) (server.cpp:18-207, client.cpp:9-70).
+Pentru fiecare comandă (login, get-logged-users, get-proc-info, quit) serverul instanțiază un socketpair și un copil rulează logica, trimițând rezultatul textual părintelui (server.cpp:115-206, 235-335).
+Comanda logout folosește un pipe anonim: copilul scrie mai întâi un cod de status, apoi mesajul complet, iar părintele îl citește secvențial pentru a decide dacă resetarea stării poate continua (server.cpp:301-420).
+Clientul nu folosește procese copil; comunică doar prin FIFO-uri, însă tratează robust lungimea răspunsului pentru a ști exact câți octeți să citească (client.cpp:47-67).
+Toate mecanismele sunt închise și unlink-ate corect la final pentru a evita descriptorii/leak-urile (server.cpp:375-389, client.cpp:72-77).
+Fluxul unei Comenzi (ex. get-proc-info : pid)
+
+Părintele confirmă că utilizatorul e autentificat și validează PID-ul numeric (server.cpp:260-274).
+Se lansează executa_in_copil; în copil se apelează getProcInfo(pid) din server.h:92-137, care citește /proc/<pid>/status, extrage câmpurile relevante și formatează răspunsul text (server.cpp:277-285).
+Copilul scrie rezultatul prin socketpair, se închide și iese; părintele citește întreg payload-ul, așteaptă copilul, apoi îl trimite clientului cu prefix de lungime (server.cpp:119-136, server.cpp:280-284, server.cpp:85-94).
+În client, după scrierea comenzii, se citește uint32_t lungimea, se convertește cu ntohl, apoi se citește exact payload-ul și se afișează (client.cpp:55-69).
+Dacă răspunsul începe cu ERROR, serverul nu actualizează starea; când e OK, variabilele este_logat și utilizator_curent sunt actualizate sau resetate în părintele serverului (server.cpp:241-249, server.cpp:418-425).
+Funcții de Business Logic (server.h)
+
+login citește useri.txt, curăță spațiile și compară utilizatorii (server.h:28-52); e invocată în copil pentru autentificare și se reflectă în starea părintelui doar dacă răspunsul începe cu OK (server.cpp:235-249).
+getLoggedUsers parcurge structurile utmp pentru utilizatorii sistemului (server.h:59-90); trimite un mesaj fallback dacă lista e goală.
+getProcInfo deschide /proc/<pid>/status, extrage câmpurile solicitate și gestionează cazurile lipsă/eroare cu mesaje text (server.h:92-137).
+curata elimină toate caracterele de spațiu dintr-un string; e folosită pentru curățarea argumentelor login și a valorilor din /proc (server.h:16-26, server.h:108-119).
+Funcțiile sunt pure (nu fac IPC) și pot fi testate individual, ceea ce separă logica aplicației de infrastructura de comunicare.
+Diagramă Textuală
+
+[Client CLI] --(FIFO:client_to_server)--> [Server părinte]
+[Server părinte] --fork/socketpair--> [Copil comandă]
+[Copil logout] --pipe status--> [Părinte] --socketpair (alte comenzi)--> [Părinte]
+[Server părinte] --(FIFO:server_to_client, len+payload)--> [Client CLI]
+Înțelegere și Testare
+
+Serverul suportă o singură sesiune activă; un nou login e respins până la logout (server.cpp:235-305).
+quit forțează răspuns din copil, părinte îl forwardează și închide FIFO-urile înainte de a ieși (server.cpp:430-447).
+Teste recomandate: login valid/invalid, comenzi protejate fără login, get-proc-info cu PID valid/invalid, logout, quit, și verificarea erorilor deliberate (de exemplu renumirea useri.txt pentru a vedea mesajul de eșec la login).
+Dacă vrei să aprofundezi în continuare: 1) rulează strace pe server ca să vezi ordinea apelurilor de sistem; 2) adaugă logging per proces copil pentru a urmări fluxul complet; 3) extinde clientul cu istoric de comenzi sau threading pentru a observa comportamentul concurent.
